@@ -28,4 +28,4 @@ Over the 8 weeks, the course moves through tokenization, transformer architectur
 
 ## Where Things Stand
 
-I'll keep this updated as the course progresses; check the most recent `week-XX/` folder for my latest work.
+I'll keep this updated as the course progresses; check the most recent `week-XX/` folder for my latest work as I'll only add a specific week's folder when needed.
