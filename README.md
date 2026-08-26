@@ -18,6 +18,7 @@ Over the 8 weeks, the course moves through tokenization, transformer architectur
 - `project/`  will focus on code and documentation for my final project
 - `CLAUDE.md` contains instructions for AI coding assistants working in this repo
 - `README.md` this file
+- `Test_GitHub_Google_Colab_Save.ipynb` was a test save from my Google Colab to this GitHub repo
 
 ## Tools I'm Using
 
