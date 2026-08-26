@@ -14,7 +14,7 @@ Over the 8 weeks, the course moves through tokenization, transformer architectur
 
 - `week-01/` through `week-08/` will contain weekly assignments and/or notebooks
 - `notes/` my research notes and reading annotations
-- 'practice/' will be used for testing ideas before adding to assignments & projects
+- `practice/` will be used for testing ideas before adding to assignments & projects
 - `project/`  will focus on code and documentation for my final project
 - `CLAUDE.md` contains instructions for AI coding assistants working in this repo
 - `README.md` this file
