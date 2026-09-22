@@ -37,3 +37,19 @@ My own work: choosing the domain-relevant test prompt, predicting each sampling 
 Used Claude for: JSON schema structure, boilerplate prompt scaffolding (system message format, few-shot framing), notebook code (metrics functions, test harness, fixture wiring), debugging live API integration (model name, SDK compatibility with Gemini's newer key format, JSON parsing around reasoning text).
 
 My own work: the six-category taxonomy (device, treatment, lifestyle, supply, account, caregiver) and where to draw the lines between them, all category definitions, all example tickets and their category/severity assignments (drawn from real product concerns from my time at Bigfoot Biomedical), the severity framework (adapted from a clinical ticket severity matrix I use professionally), the downstream-consequence rule for v2, and all analysis and conclusions in the notebook's write-up, including catching that a result didn't reproduce across two live runs and correcting my own initial conclusion.
+
+## Week 4: Multi-Tool Assistant
+
+AI tool used: Claude (Anthropic), chat interface.
+
+What Claude helped with:
+- Scaffolding the live tool-calling loop (message/tool_call/tool_result cycle) against the Gemini OpenAI-compatible endpoint.
+- Debugging: diagnosed a Windows multiprocessing hang in the guarded run_python timeout and suggested switching to a ThreadPoolExecutor-based timeout instead.
+- Suggested query phrasings to stress-test schema edges (invalid enum values, ambiguous units) while evaluating the tools.
+- Reviewed draft write-up text (PR description, this file, README) for clarity.
+
+What stayed mine:
+- Domain choice (diabetes glucose data) and all three tool schemas.
+- The synthetic patient data and glucose classification thresholds (sourced and verified: Battelino et al. 2019, Diabetes Care).
+- Running the actual evaluation queries and identifying which one produced a real function-calling failure to document (issue #7).
+- Analysis and conclusions in the PR description and README.
