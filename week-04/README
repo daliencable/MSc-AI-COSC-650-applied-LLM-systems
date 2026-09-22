@@ -1,0 +1,14 @@
+# Week 4: Multi-Tool Assistant
+
+Diabetes glucose assistant over synthetic patient data (P001-P003, no real patients & no medical advice).
+
+## Tools
+
+- **get_daily_summary**: retrieves daily mean glucose for a patient over a fixed period (7, 14, or 30 days), in mg/dL or mmol/L.
+- **classify_glucose**: categorizes a single glucose value (very_low, low,cin_range, high, very_high). Thresholds are from the international consensus on time-in-range: Battelino T, Danne T, Bergenstal RM, et al. Clinical targets for continuous glucose monitoring data interpretation. Diabetes Care. 2019;42(8):1593-1603.
+- **run_python**: guarded arithmetic evaluator, used to average or convert values returned by the other two tools.
+
+## Guardrail
+
+run_python permits arithmetic only: digits, whitespace, and + - * / ** ().
+The expression is checked against an allowlist before evaluation, then parsed with a restricted AST evaluator that recognizes only constants and basic operators, no names, calls, imports, or attributes. A 2-second timeout runs the evaluation in a worker thread. Blocked: filesystem access, network calls, process
