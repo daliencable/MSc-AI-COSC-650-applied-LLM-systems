@@ -1,0 +1,611 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "ec07619e",
+   "metadata": {},
+   "source": [
+    "# Week 5: RAG Pipeline with Retrieval Evaluation\n",
+    "**Dalien Cable | COSC 650 Applied LLM Systems**\n",
+    "\n",
+    "A retrieval-augmented generation pipeline over 8 diabetes care and prevention documents: PDF ingestion and cleaning, three chunking configurations, local embeddings (all-MiniLM-L6-v2) in a FAISS index, chunk-level precision and recall on 10 test questions, and grounded answers from Gemini.\n",
+    "\n",
+    "### Corpus\n",
+    "All documents are PDFs, because that is how the majority of scientific papers and clinical guidelines are published. The PDFs are kept locally and are not committed to this repository to ensure no copyright issues or redistribution to 3rd party sites like GitHub occur.\n",
+    "\n",
+    "| File | Document | Publisher |\n",
+    "|---|---|---|\n",
+    "| cdc_174262_DS1 | Newer Pharmacologic Treatments in Adults With Type 2 Diabetes (clinical guideline, author manuscript) | American College of Physicians, via CDC Stacks |\n",
+    "| dprp-standards | Diabetes Prevention Recognition Program Standards | CDC |\n",
+    "| dsa509 | MANAGEMENT OF DIABETES MELLITUS STANDARDS OF CARE AND CLINICAL PRACTICE GUIDELINES | WHO Regional Office for the Eastern Mediterranean |\n",
+    "| guidance-on-global-monitoring-for-diabetes | Guidance on global monitoring for diabetes prevention and control | WHO |\n",
+    "| HPDP_Diabetes_guide_for_diabetes_care | Diabetes Care Guidelines | Vermont Department of Health |\n",
+    "| On-your-way-to-preventing-type-2-diabetes | On Your Way to Preventing Type 2 Diabetes | CDC |\n",
+    "| Optimal_Diabetes_Care | Optimal Diabetes Care specifications | MN Community Measurement |\n",
+    "| who-ucn-ncd-20.1-eng | HEARTS-D: Diagnosis and management of type 2 diabetes | WHO |"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1952d774-9b2a-478f-8490-7e9355174c43",
+   "metadata": {},
+   "source": [
+    "## Setup\n",
+    "Loads the embedding model. `HF_HOME` stores the downloaded model in a local `.hf_cache` folder, which is excluded from the repo in `.gitignore`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "265d5c6c",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n"
+     ]
+    },
+    {
+     "data": {
+      "application/vnd.jupyter.widget-view+json": {
+       "model_id": "e44db931b5c14cafad08d1363c0b7ae2",
+       "version_major": 2,
+       "version_minor": 0
+      },
+      "text/plain": [
+       "Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "import os, re, pathlib, numpy as np\n",
+    "os.environ['HF_HOME'] = str((pathlib.Path('.') / '.hf_cache').resolve())\n",
+    "from sentence_transformers import SentenceTransformer\n",
+    "import faiss\n",
+    "embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5bdfbd2e-2f3f-4e3e-a277-7999087a931a",
+   "metadata": {},
+   "source": [
+    "## Part 1: Build the pipeline\n",
+    "### Load the PDFs\n",
+    "Reads each PDF with pypdf, joins its pages into one text, and records the page count. The page count is needed by the cleaning step below."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "7077f28b-6cde-4a8e-9045-6465173d6aa1",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "cdc_174262_DS1: 19 pages, 53,097 chars\n",
+      "dprp-standards: 65 pages, 166,731 chars\n",
+      "dsa509: 35 pages, 51,807 chars\n",
+      "guidance-on-global-monitoring-for-diabetes: 94 pages, 215,230 chars\n",
+      "HPDP_Diabetes_guide_for_diabetes_care: 2 pages, 4,197 chars\n",
+      "On-your-way-to-preventing-type-2-diabetes: 15 pages, 25,097 chars\n",
+      "Optimal_Diabetes_Care: 4 pages, 10,196 chars\n",
+      "who-ucn-ncd-20.1-eng: 35 pages, 62,460 chars\n"
+     ]
+    }
+   ],
+   "source": [
+    "from pypdf import PdfReader\n",
+    "\n",
+    "CORPUS = pathlib.Path('corpus')\n",
+    "DOCS = {}    # file name -> the document's text\n",
+    "PAGES = {}   # file name -> how many pages it has\n",
+    "\n",
+    "for path in sorted(CORPUS.glob('*.pdf')):\n",
+    "    reader = PdfReader(path)\n",
+    "    text = '\\n'.join(page.extract_text() or '' for page in reader.pages)\n",
+    "    DOCS[path.stem] = text\n",
+    "    PAGES[path.stem] = len(reader.pages)\n",
+    "    print(f'{path.stem}: {len(reader.pages)} pages, {len(text):,} chars')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d705c1a5-75f3-4360-aa55-232ccc5c4738",
+   "metadata": {},
+   "source": [
+    "### Clean the extracted text\n",
+    "PDF extraction pulls out everything printed on a page, including running headers, footers, and page numbers. Left in, these lines get copied into many chunks and make unrelated chunks look alike to the retriever. I first saw this in an earlier exercise, where an FDA guidance document's running header ended up inside chunks, and the fix is to remove such lines at extraction time, before chunking, while each one is still a single intact line. Rather than hard-coding one header, this step detects any line that repeats across pages, so it works on all 8 documents without per-document rules.\n",
+    "\n",
+    "**Rule.** A line is removed if (1) it appears on at least 40% of a document's pages (documents of 3+ pages only), or (2) it contains no letters, such as page numbers, stray dashes, and number-only fields from fill-in templates.\n",
+    "\n",
+    "**Why 40%.** Some headers alternate between left and right pages, so they appear on about half the pages. 40% catches them but keeps repeated content, such as \"Method of estimation\" in the WHO monitoring guidance (32% of pages). Documents under 3 pages skip test 1, because on a 2-page document any line appearing twice would count.\n",
+    "\n",
+    "**Checks.** Before settling the rule I listed the most repeated lines per document and checked borderline cases in the PDFs: \"Insulin\" in dsa509 is a running header, and the repeated number-colon-number lines in the prevention booklet belong to its fill-in templates, so removing both is correct. Each document shrank by less than 10% (output below), so the rule removes noise.\n",
+    "\n",
+    "**Not handled.** Reference lists, author lists, and table text are left in."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "3cf4a552-e2a2-4395-a859-83f3ef01a6b9",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "cdc_174262_DS1: 53,097 -> 49,981 chars\n",
+      "dprp-standards: 166,731 -> 162,671 chars\n",
+      "dsa509: 51,807 -> 51,089 chars\n",
+      "guidance-on-global-monitoring-for-diabetes: 215,230 -> 210,896 chars\n",
+      "HPDP_Diabetes_guide_for_diabetes_care: 4,197 -> 4,197 chars\n",
+      "On-your-way-to-preventing-type-2-diabetes: 25,097 -> 24,973 chars\n",
+      "Optimal_Diabetes_Care: 10,196 -> 9,194 chars\n",
+      "who-ucn-ncd-20.1-eng: 62,460 -> 60,839 chars\n"
+     ]
+    }
+   ],
+   "source": [
+    "from collections import Counter\n",
+    "\n",
+    "def line_key(line):\n",
+    "    return re.sub(r'\\d+', '#', line.strip())\n",
+    "\n",
+    "def clean(text, n_pages):\n",
+    "    counts = Counter(line_key(l) for l in text.splitlines() if l.strip())\n",
+    "    kept = []\n",
+    "    for line in text.splitlines():\n",
+    "        s = line.strip()\n",
+    "        repeats_a_lot = n_pages >= 3 and counts[line_key(line)] >= 0.4 * n_pages\n",
+    "        only_numbers_or_symbols = s != '' and re.fullmatch(r'[\\d\\W_]+', s) is not None\n",
+    "        if not (repeats_a_lot or only_numbers_or_symbols):\n",
+    "            kept.append(line)\n",
+    "    return '\\n'.join(kept)\n",
+    "\n",
+    "CLEAN = {}\n",
+    "for name, text in DOCS.items():\n",
+    "    CLEAN[name] = clean(text, PAGES[name])\n",
+    "    print(f'{name}: {len(text):,} -> {len(CLEAN[name]):,} chars')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "064bc269-38a3-4862-b158-6df8b2ead41d",
+   "metadata": {},
+   "source": [
+    "### Chunk, embed, and retrieve\n",
+    "Each document is chunked separately, therefore no chunk mixes text from two documents. `SOURCES` records which document each chunk came from.\n",
+    "\n",
+    "| Config | How it cuts | Chunks |\n",
+    "|---|---|---|\n",
+    "| small (120/20) | every 120 characters, 20 overlap (starter) | 5,631 |\n",
+    "| large (320/40) | every 320 characters, 40 overlap (starter) | 2,013 |\n",
+    "| by-sentence | whole sentences packed up to 500 characters | 1,209 |\n",
+    "\n",
+    "**Why by-sentence replaces the starter's by-paragraph.** \n",
+    "\n",
+    "by-paragraph splits on blank lines, and PDF extraction produces almost none. On this corpus it produced only 22 chunks, averaging about 26,000 characters each. The embedding model reads at most 256 tokens (roughly 1,000 characters) and ignores the rest, so most of each chunk would have been invisible to search. Sentence endings survive PDF extraction, therefore by-sentence keeps the idea of cutting at natural boundaries whilst staying under the model's limit. `chunk_paragraph` is left in the cell as the record of that result.\n",
+    "\n",
+    "`build` and `retrieve` are unchanged from the starter."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "1d524b01",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "small (120/20)   -> 5631 chunks\n",
+      "large (320/40)   -> 2013 chunks\n",
+      "by-sentence      -> 1209 chunks\n"
+     ]
+    }
+   ],
+   "source": [
+    "def chunk_fixed(text, size, overlap):\n",
+    "    text = re.sub(r'\\s+', ' ', text).strip(); out, i = [], 0\n",
+    "    while i < len(text):\n",
+    "        out.append(text[i:i+size]); i += size - overlap\n",
+    "    return out\n",
+    "def chunk_paragraph(text):\n",
+    "    return [re.sub(r'\\s+',' ',p).strip() for p in text.split('\\n\\n') if p.strip()]\n",
+    "\n",
+    "def chunk_sentences(text, max_chars=500):\n",
+    "    text = re.sub(r'\\s+', ' ', text).strip()\n",
+    "    sentences = re.split(r'(?<=[.!?])\\s+', text)\n",
+    "    chunks, current = [], ''\n",
+    "    for s in sentences:\n",
+    "        if current and len(current) + len(s) + 1 > max_chars:\n",
+    "            chunks.append(current)\n",
+    "            current = s\n",
+    "        else:\n",
+    "            current = (current + ' ' + s).strip()\n",
+    "    if current:\n",
+    "        chunks.append(current)\n",
+    "    return chunks\n",
+    "\n",
+    "def chunk_corpus(chunker):\n",
+    "    chunks, sources = [], []\n",
+    "    for name, text in CLEAN.items():\n",
+    "        for c in chunker(text):\n",
+    "            chunks.append(c)\n",
+    "            sources.append(name)\n",
+    "    return chunks, sources\n",
+    "\n",
+    "configs, SOURCES = {}, {}\n",
+    "for label, chunker in {'small (120/20)': lambda t: chunk_fixed(t, 120, 20),\n",
+    "                       'large (320/40)': lambda t: chunk_fixed(t, 320, 40),\n",
+    "                       'by-sentence':   chunk_sentences}.items():\n",
+    "    configs[label], SOURCES[label] = chunk_corpus(chunker)\n",
+    "\n",
+    "for n, c in configs.items():\n",
+    "    print(f'{n:16s} -> {len(c)} chunks')\n",
+    "\n",
+    "def build(chunks):\n",
+    "    e = embedder.encode(chunks, normalize_embeddings=True).astype('float32')\n",
+    "    idx = faiss.IndexFlatIP(e.shape[1]); idx.add(e); return idx\n",
+    "def retrieve(idx, chunks, q, k=3):\n",
+    "    qe = embedder.encode([q], normalize_embeddings=True).astype('float32')\n",
+    "    # FAISS uses -1 for missing results when fewer than k chunks exist.\n",
+    "    return [chunks[i] for i in idx.search(qe, k)[1][0] if i >= 0]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "03b4f4b3",
+   "metadata": {},
+   "source": [
+    "## Part 2: Evaluate retrieval\n",
+    "### Test questions, with relevance decided in advance\n",
+    "Each of the 10 questions is paired with a short fact copied from the corpus. The facts were written before any retrieval was run, and they define relevance: a chunk is relevant to a question if it contains that question's fact.\n",
+    "\n",
+    "The questions mix exact wording from the documents with plain-language paraphrases (for example \"if sugar stays high\"), and include two on telling type 1 from type 2 diabetes, where the passages share almost all their vocabulary.\n",
+    "\n",
+    "The starter's answer-recall@3 score below is kept as a baseline & it only asks whether the fact appears anywhere in the top 3."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "a1220515",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "small (120/20)   answer-recall@3: 4/10 = 0.40\n",
+      "large (320/40)   answer-recall@3: 3/10 = 0.30\n",
+      "by-sentence      answer-recall@3: 2/10 = 0.20\n"
+     ]
+    }
+   ],
+   "source": [
+    "qa = [\n",
+    "    ('what A1C level is used to diagnose diabetes',                       '6.5%'),\n",
+    "    ('what fasting blood sugar confirms a diabetes diagnosis',            '126 mg/dl'),\n",
+    "    ('which medicines should be added to metformin if sugar stays high',  'SGLT-2 inhibitor or GLP-1 agonist'),\n",
+    "    ('how long does a lifestyle change program last',                     '12 months'),\n",
+    "    ('how many sessions are in the first six months of the program',       '16 sessions'),\n",
+    "    ('how much weight should someone lose to prevent type 2 diabetes',     '5% to 7%'),\n",
+    "    ('how much exercise per week is recommended',                         '150 minutes'),\n",
+    "    ('what blood pressure target counts as optimal diabetes care',         '<140'),\n",
+    "    ('what signs suggest type 1 rather than type 2 diabetes',              'ketones'),\n",
+    "    ('when should a newly diagnosed person be treated as type 1',          'insulin'),\n",
+    "]\n",
+    "indices = {n: build(c) for n, c in configs.items()}\n",
+    "for n, c in configs.items():\n",
+    "    hits = sum(1 for q, fact in qa if fact.lower() in ' '.join(retrieve(indices[n], c, q)).lower())\n",
+    "    print(f'{n:16s} answer-recall@3: {hits}/{len(qa)} = {hits/len(qa):.2f}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "96925702-1420-4f89-8f3b-61f5ba869e43",
+   "metadata": {},
+   "source": [
+    "### Check every fact exists in the corpus\n",
+    "A fact missing from every document would make its question impossible to score, whatever the chunking chosen. This check confirms all 10 facts appear in at least one cleaned document. The blood pressure fact was corrected from `140/90` to `<140` to match the source's wording."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "6f66baea-a55c-44ef-843d-89de0ab2aea5",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "6.5%                                 -> ['cdc_174262_DS1', 'guidance-on-global-monitoring-for-diabetes', 'On-your-way-to-preventing-type-2-diabetes', 'who-ucn-ncd-20.1-eng']\n",
+      "126 mg/dl                            -> ['guidance-on-global-monitoring-for-diabetes', 'who-ucn-ncd-20.1-eng']\n",
+      "SGLT-2 inhibitor or GLP-1 agonist    -> ['cdc_174262_DS1']\n",
+      "12 months                            -> ['cdc_174262_DS1', 'dprp-standards', 'HPDP_Diabetes_guide_for_diabetes_care', 'Optimal_Diabetes_Care']\n",
+      "16 sessions                          -> ['dprp-standards']\n",
+      "5% to 7%                             -> ['dprp-standards']\n",
+      "150 minutes                          -> ['dprp-standards', 'guidance-on-global-monitoring-for-diabetes', 'HPDP_Diabetes_guide_for_diabetes_care', 'On-your-way-to-preventing-type-2-diabetes', 'who-ucn-ncd-20.1-eng']\n",
+      "<140                                 -> ['dsa509', 'Optimal_Diabetes_Care']\n",
+      "ketones                              -> ['dsa509', 'who-ucn-ncd-20.1-eng']\n",
+      "insulin                              -> ['cdc_174262_DS1', 'dsa509', 'guidance-on-global-monitoring-for-diabetes', 'who-ucn-ncd-20.1-eng']\n"
+     ]
+    }
+   ],
+   "source": [
+    "for q, fact in qa:\n",
+    "    found_in = [n for n, t in CLEAN.items() if fact.lower() in re.sub(r'\\s+', ' ', t).lower()]\n",
+    "    print(f'{fact:36s} -> {found_in or \"NOT FOUND\"}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d3d0d0ed-41c2-417d-a973-19130a8aff43",
+   "metadata": {},
+   "source": [
+    "### Chunk-level precision and recall (k = 3)\n",
+    "- **Precision@3** = relevant chunks retrieved / 3. Of what would be handed to the LLM, how much is useful?\n",
+    "- **Recall@3** = relevant chunks retrieved / all relevant chunks in that config. Of everything that could have been found, how much was?\n",
+    "\n",
+    "**Questions with no relevant chunk.** \n",
+    "\n",
+    "A fixed-size chunker can cut a fact in half at a chunk boundary. If that happens everywhere the fact appears, no chunk contains the whole fact, recall cannot be calculated (it would divide by zero), and the question is counted here instead. The result was zero for all three configs: every fact survived whole in at least one chunk."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "77782dc5-7c49-42e0-8ff8-7eec421bacbd",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "small (120/20)   precision@3: 0.17   recall@3: 0.17   (questions with no relevant chunk: 0)\n",
+      "large (320/40)   precision@3: 0.13   recall@3: 0.04   (questions with no relevant chunk: 0)\n",
+      "by-sentence      precision@3: 0.13   recall@3: 0.06   (questions with no relevant chunk: 0)\n"
+     ]
+    }
+   ],
+   "source": [
+    "K = 3\n",
+    "rows = []\n",
+    "\n",
+    "for n, c in configs.items():\n",
+    "    precisions, recalls = [], []\n",
+    "    for q, fact in qa:\n",
+    "        relevant = sum(1 for ch in c if fact.lower() in ch.lower())\n",
+    "        got = retrieve(indices[n], c, q, k=K)\n",
+    "        hits = sum(1 for ch in got if fact.lower() in ch.lower())\n",
+    "        precisions.append(hits / K)\n",
+    "        if relevant > 0:\n",
+    "            recalls.append(hits / relevant)\n",
+    "        rows.append((n, q, relevant, hits))\n",
+    "    print(f'{n:16s} precision@{K}: {sum(precisions)/len(precisions):.2f}   '\n",
+    "          f'recall@{K}: {sum(recalls)/len(recalls):.2f}   '\n",
+    "          f'(questions with no relevant chunk: {len(qa) - len(recalls)})')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "1856c0e6-083a-4542-8684-bac35687c00f",
+   "metadata": {},
+   "source": [
+    "### Results per question\n",
+    "Each cell shows **hits / relevant**: how many of the top 3 retrieved chunks contained the fact, out of how many chunks contain it in that config. For example, `1/4` means 1 of the 3 retrieved chunks was relevant, and 4 relevant chunks existed. Rows where one config has hits and another has none are where the configs disagree."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "5b9e99c8-3d26-4a2b-9dbb-51b7e0fc1845",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "question                                                      small    large  sentence\n",
+      "what A1C level is used to diagnose diabetes                1/4      1/5      1/4     \n",
+      "what fasting blood sugar confirms a diabetes diagnosis     0/4      0/5      0/4     \n",
+      "which medicines should be added to metformin if sugar stay 0/2      0/2      0/2     \n",
+      "how long does a lifestyle change program last              0/23     0/19     0/15    \n",
+      "how many sessions are in the first six months of the progr 1/3      0/3      0/2     \n",
+      "how much weight should someone lose to prevent type 2 diab 1/1      0/1      0/1     \n",
+      "how much exercise per week is recommended                  2/12     2/10     3/10    \n",
+      "what blood pressure target counts as optimal diabetes care 0/5      0/3      0/3     \n",
+      "what signs suggest type 1 rather than type 2 diabetes      0/16     0/13     0/11    \n",
+      "when should a newly diagnosed person be treated as type 1  0/191    1/142    0/101   \n"
+     ]
+    }
+   ],
+   "source": [
+    "print(f\"{'question':58s} {'small':>8s} {'large':>8s} {'sentence':>9s}\")\n",
+    "for q, fact in qa:\n",
+    "    line = f'{q[:58]:58s}'\n",
+    "    for n in configs:\n",
+    "        rel, hits = next((r, h) for (cn, cq, r, h) in rows if cn == n and cq == q)\n",
+    "        line += f' {hits}/{rel:<6}'\n",
+    "    print(line)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "ee7e0f5e-0ef6-42d3-ac45-4d9a5aad5900",
+   "metadata": {},
+   "source": [
+    "### Looking at what was retrieved\n",
+    "show prints the top 3 chunks for one question and config, marking each as relevant or a miss. Only the first 150 characters of each chunk are shown. It is run here for the weight-loss question in large and small (where they disagree), and for the metformin question in by-sentence (used in Part 4)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "b6d6417a-594e-4ac4-88c1-8d9783fd14fb",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "how much weight should someone lose to prevent type 2 diabetes   | fact: 5% to 7%   | config: large (320/40)\n",
+      "  [miss    ] sk for type 2 diabetes at a lower weight (about 15 pounds lower than weights in the 1 Point column). Talk to your doctor to see if you should have you\n",
+      "  [miss    ] goals for patients with type 2 diabetes include adequate glycemic control and primary and secondary prevention of atherosclerotic cardiovascular and k\n",
+      "  [miss    ] demonstrate that there has been a reduction in risk of developing type 2 diabetes among completers in the evaluation cohort by showing that at least 6\n",
+      "how much weight should someone lose to prevent type 2 diabetes   | fact: 5% to 7%   | config: small (120/20)\n",
+      "  [miss    ]  are at increased risk for type 2 diabetes at a lower weight (about 15 pounds lower than weights in the 1 Point column).\n",
+      "  [RELEVANT] th prediabetes lose 5% to 7% of their body weight and reduce their risk of developing type 2 diabetes by 58% (71% for pe\n",
+      "  [miss    ] normal body weight and regular physical activity are the mainstay of diabetes management. • People with diabetes should \n",
+      "which medicines should be added to metformin if sugar stays high   | fact: SGLT-2 inhibitor or GLP-1 agonist   | config: by-sentence\n",
+      "  [miss    ] Clinical Considerations • Metformin (unless contraindicated) and lifestyle modifications are the first steps in managing type 2 diabetes in most patie\n",
+      "  [miss    ] • A second-generation sulfonylurea (preferably gliclazide) can be used as initial (first-line) treatment when metformin is contraindicated or not tole\n",
+      "  [miss    ] Interventions With No Recommendations Evidence was inconclusive to develop recommendations for both add-on tirzepatide and add-on long-acting insulins\n"
+     ]
+    }
+   ],
+   "source": [
+    "def show(question_number, config):\n",
+    "    q, fact = qa[question_number]\n",
+    "    print(f'{q}   | fact: {fact}   | config: {config}')\n",
+    "    for ch in retrieve(indices[config], configs[config], q):\n",
+    "        mark = 'RELEVANT' if fact.lower() in ch.lower() else 'miss    '\n",
+    "        print(f'  [{mark}] {ch[:150]}')\n",
+    "\n",
+    "show(5, 'large (320/40)')\n",
+    "show(5, 'small (120/20)')\n",
+    "show(2, 'by-sentence')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "34541a54-67a4-41e5-aa27-32026312d87e",
+   "metadata": {},
+   "source": [
+    "### Part 2 analysis\n",
+    "Overall small (120/20) performed the best, with precision and recall of 0.17. large and by-sentence both scored 0.13 precision, with lower recall. All three are low: most retrieved chunks did not contain the answer.\n",
+    "\n",
+    "Where they disagree: only small found the weight-loss fact (5% to 7%). In small, the matching chunk is almost entirely the answer, so it matches the question closely. In large, the same sentence is buried in a longer chunk with other text, and chunks that merely sound like the question ranked higher. by-sentence did best on the exercise question, where the answer is one clear sentence.\n",
+    "\n",
+    "Recall mislead around \"insulin\" as it appears in over 100 chunks, so even a perfect top 3 scores almost zero recall. Recall only means something when the fact is specific.\n",
+    "\n",
+    "Five questions scored zero in every config."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "ba3bbf05",
+   "metadata": {},
+   "source": [
+    "## Part 3: Generate a grounded answer\n",
+    "Builds a prompt from the top 3 retrieved chunks, tells Gemini to answer only from that context, and returns its answer. The model is `gemini-3.5-flash`, the Flash model available to my API key. The weight-loss question is asked once with each config's chunks, to show how retrieval quality affects the answer."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "a4a821e8",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "SMALL: Based on the provided context, someone should lose **5% to 7% of their body weight** to reduce their risk of developing type 2 diabetes.\n",
+      "LARGE: Based on the provided context, to show a reduction in the risk of developing type 2 diabetes, someone should achieve either:\n",
+      "\n",
+      "* At least 5% weight loss (12 months after the cohort began), or\n",
+      "* At least 4% weight loss (and at least 8 s).\n",
+      "SENTENCE: Based on the provided context, a specific amount of weight to lose is not mentioned. The context only advises to \"set a weight loss goal\" and that overweight patients should \"reduce weight by reducing their food (calorie) intake.\"\n"
+     ]
+    }
+   ],
+   "source": [
+    "from dotenv import load_dotenv\n",
+    "load_dotenv('.env')\n",
+    "\n",
+    "def gemini_chat(messages, model='gemini-3.5-flash', **kw):\n",
+    "    if not os.environ.get('GEMINI_API_KEY'):\n",
+    "        return None\n",
+    "    from openai import OpenAI\n",
+    "    client = OpenAI(api_key=os.environ['GEMINI_API_KEY'], base_url='https://generativelanguage.googleapis.com/v1beta/openai/')\n",
+    "    return client.chat.completions.create(model=model, messages=messages, **kw).choices[0].message.content\n",
+    "\n",
+    "def answer(q, config='by-sentence'):\n",
+    "    ctx = retrieve(indices[config], configs[config], q, k=3)\n",
+    "    prompt = 'Answer only from the context.\\nContext:\\n- ' + '\\n- '.join(ctx) + f'\\nQuestion: {q}\\nAnswer:'\n",
+    "    out = gemini_chat([{'role':'user','content':prompt}], temperature=0)\n",
+    "    return out if out is not None else '[API-BLOCKED] set GEMINI_API_KEY to generate; grounded prompt was built'\n",
+    "\n",
+    "q = qa[5][0]\n",
+    "print('SMALL:', answer(q, 'small (120/20)'))\n",
+    "print('LARGE:', answer(q, 'large (320/40)'))\n",
+    "print('SENTENCE:', answer(q, 'by-sentence'))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d1c1c621-d693-42b3-9146-8459e8f15a48",
+   "metadata": {},
+   "source": [
+    "### Part 3 observations\n",
+    "- **small (retrieval hit):** correct: 5% to 7% of body weight.\n",
+    "- **large (retrieval miss):** confident and wrong. It presented a CDC program's performance targets as personal advice, and repeated a word cut off by a chunk boundary (\"at least 8 s\").\n",
+    "- **by-sentence (retrieval miss):** safe. It said the context doesn't give an amount.\n",
+    "\n",
+    "Two misses with two different outcomes. The confident wrong answer is the most dangerous, because nothing tells the reader it's wrong.\n",
+    "\n",
+    "I reran the notebook from a clean restart with temperature 0, and the same pattern held: correct, confident-wrong, and safe refusal. The exact wording changed slightly between runs, which is expected from an LLM."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6323636e",
+   "metadata": {},
+   "source": [
+    "## Part 4: One failure, its cause, and a mitigation\n",
+    "**The failure.** \"Which medicines should be added to metformin if sugar stays high\" scored zero in all three configs. The answer (add an SGLT-2 inhibitor or GLP-1 agonist) is in the ACP guideline, but by-sentence retrieved three other metformin chunks instead (see the `show` output in Part 2). One came from the same section as the answer, so retrieval found the right area but picked the wrong chunk.\n",
+    "\n",
+    "**Cause.** The question and the document use different words. The question says \"if sugar stays high\"; the guideline says things like \"inadequate glycemic control\" and \"add-on therapy\". The only strong word they share is metformin, so retrieval returned metformin chunks. Because all three configs failed, chunking isn't the cause.\n",
+    "\n",
+    "**Mitigation.** Rewrite the question in the document's own terms before searching, by hand or with an LLM step, for example: \"which drugs are recommended as add-on therapy to metformin for inadequate glycemic control\". Retrieving more chunks, or using an embedding model trained on medical text, would also likely help.\n",
+    "\n",
+    "## Summary\n",
+    "I built a RAG pipeline with 8 diabetes clinical guidlines PDFs, stripped out repeated headers and footers before chunking, and tested three ways of chunking on 10 questions. The smallest chunks worked best. A short chunk that holds a single fact lines up well with a specific question, while a longer chunk buries that fact among other text. When retrieval missed, Gemini failed in different ways: once it gave a confident wrong answer, and once it said honestly that the answer wasn't there. My main failure case came down to wording, not chunking. The question used everyday language and the guideline used clinical terms, so rewriting the question in the guideline's language would likely fix it."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.9"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
