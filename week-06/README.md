@@ -1,42 +1,42 @@
-# Week 5: RAG Pipeline with Retrieval Evaluation
+# Week 6: Advanced Retrieval, Transform and Measure
 
-A retrieval-augmented generation (RAG) pipeline over 8 diabetes care and prevention PDFs. It cleans the extracted text, compares three chunking configurations with chunk-level precision and recall, and generates grounded answers with Gemini.
+This week extends my Week 5 RAG pipeline on the diabetes documents. I added two query transformations (pseudo-relevance feedback and HyDE) and a MedCPT re-ranker, then measured what each one changed on the same 10 questions.
 
-Notebook: `week5_RAG_Dalien_Cable.ipynb`
+## What's in this folder
 
-## What it does
-1. Loads 8 PDFs and removes repeated headers, footers, and page numbers before chunking.
-2. Chunks the text three ways: small fixed-size (120/20), large fixed-size (320/40), and whole sentences packed up to 500 characters.
-3. Embeds the chunks locally with `all-MiniLM-L6-v2` and stores them in a FAISS index.
-4. Scores retrieval on 10 test questions, with relevance decided in advance: a chunk is relevant if it contains the question's fact.
-5. Sends the top 3 chunks to Gemini (`gemini-3.5-flash`) with an instruction to answer only from that context.
+- `week6_RAG_Expanded_Dalien_Cable.ipynb`: the full notebook, with the write-ups in markdown cells
 
-## Results (k = 3)
+## Setup
 
-| Config | Precision | Recall | Answer found in top 3 |
-|---|---|---|---|
-| small (120/20) | 0.17 | 0.17 | 4/10 |
-| large (320/40) | 0.13 | 0.04 | 3/10 |
-| by-sentence | 0.13 | 0.06 | 2/10 |
+- 8 diabetes PDFs (CDC, WHO, ACP), cleaned and split by sentence into 1,209 chunks
+- Embeddings: `all-MiniLM-L6-v2`, searched with FAISS
+- 10 questions, with the answer fact decided in advance. A chunk counts as relevant only if it contains that fact exactly
+- HyDE passages are written by Gemini (`gemini-3.5-flash`) at temperature 0
+- Re-ranker: `ncbi/MedCPT-Cross-Encoder` over the top 30 results
 
-Small chunks retrieved best, because a short chunk holding one fact matches a specific question closely. When retrieval missed, Gemini sometimes gave a confident wrong answer and sometimes said the answer wasn't in the context. The main failure was a question written in everyday language that missed an answer written in clinical terms. Rewriting the question in the document's language would likely fix it.
+## Results
 
-## How to run
-The PDFs are not included in this repo, out of respect for the publishers' copyright. To run the notebook:
+Mean precision@3 across the 10 questions:
 
-1. Download the 8 documents listed below and save them in a `corpus` folder next to the notebook, using the file names shown.
-2. Create a `.env` file next to the notebook containing `GEMINI_API_KEY=your-key`.
-3. Install the libraries:
-   `pip install sentence-transformers faiss-cpu openai pypdf python-dotenv`
-4. Run all cells.
-
-| File name | Document | Publisher |
+| Pipeline | Mean P@3 | Improved / Regressed / Same |
 |---|---|---|
-| cdc_174262_DS1.pdf | Newer Pharmacologic Treatments in Adults With Type 2 Diabetes | American College of Physicians, via CDC Stacks |
-| dprp-standards.pdf | Diabetes Prevention Recognition Program Standards | CDC |
-| dsa509.pdf | Management of Diabetes Mellitus: Standards of Care and Clinical Practice Guidelines | WHO Regional Office for the Eastern Mediterranean |
-| guidance-on-global-monitoring-for-diabetes.pdf | Guidance on global monitoring for diabetes prevention and control | WHO |
-| HPDP_Diabetes_guide_for_diabetes_care.pdf | Diabetes Care Guidelines | Vermont Department of Health |
-| On-your-way-to-preventing-type-2-diabetes.pdf | On Your Way to Preventing Type 2 Diabetes | CDC |
-| Optimal_Diabetes_Care.pdf | Optimal Diabetes Care specifications | MN Community Measurement |
-| who-ucn-ncd-20.1-eng.pdf | HEARTS-D: Diagnosis and management of type 2 diabetes | WHO |
+| Baseline | 0.13 | n/a |
+| PRF | 0.17 | 3 / 4 / 3 |
+| HyDE | 0.27 | 7 / 1 / 2 |
+| Re-rank | 0.20 | 3 / 2 / 5 |
+| HyDE + re-rank | 0.20 | 6 / 2 / 2 |
+
+HyDE helped most, especially on questions written in everyday language. The re-ranker only reorders the top 30, so it can't rescue an answer ranked below that. PRF struggled because the baseline top 3 was wrong for 8 of the 10 questions, so it copied vocabulary from the wrong chunks.
+
+## Failure case
+
+The sessions question got worse under HyDE. The first chunk containing the answer dropped from rank 14 to rank 67. Gemini's passage wandered into weight loss targets and maintenance, and the real answer is a short requirements row that reads nothing like flowing prose. The full explanation is in Part 3 of the notebook.
+
+## Running it
+
+The PDFs are not committed, so the notebook won't run end to end from a fresh clone. To rerun it you need:
+
+- the 8 PDFs in a local `corpus/` folder
+- a Gemini API key in a `.env` file
+
+HyDE passages are regenerated on each full run, so the numbers can shift slightly from the ones above.
